@@ -118,31 +118,106 @@ impl <T> BipBuffer<T> {
 
     /// Reserve the requested amount of elements for writing
     pub fn reserve(&mut self, req_cap: usize) -> Option<(*mut T, usize)> {
-
-        if self.b.in_use { // Always allocate on `B` if it exists
-
+        // Always allocate on `B` if it exists
+        if self.b.in_use {
             let mut free_cap = self.get_b_free_elements();
-            if req_cap < free_cap { free_cap = req_cap; } // Don't over-allocate
-            if free_cap == 0 { return None; } // Can't allocate
-
+            // Can't allocate if no space
+            if free_cap == 0 { return None; }
+            // Don't over-allocate if we don't need to
+            if req_cap < free_cap { free_cap = req_cap; }
             self.rsvp.count = free_cap;
             self.rsvp.index = 0;
-
             let ptr = unsafe { self.data.offset(0) };
-
             return Some( (ptr, free_cap) );
-
         } else {
-            // check if space after A is larger than the space before A
-            // and use the larger one if it fits.
+            let free_cap = self.get_elements_after_a();
+            // Use the larger of the spaces before or after the A region
+            if free_cap >= self.a.index {
+                if free_cap == 0 { return None; }
+                let reserved = if req_cap < free_cap {
+                    req_cap
+                } else {
+                    free_cap
+                };
+                self.rsvp.count = reserved;
+                self.rsvp.index = 0;
+                let ptr = unsafe { self.data.offset(self.a.index as isize) };
+                return Some( (ptr, reserved) );
+            } else {
+                if self.a.index == 0 { return None; }
+                let reserved = if self.a.index < req_cap {
+                    self.a.index
+                } else {
+                    req_cap
+                };
+                self.rsvp.count = reserved;
+                self.rsvp.index = 0;
+                let ptr = unsafe { self.data.offset(0) };
+                return Some( (ptr, reserved) );
+            }
         }
-
-        // TODO: Remove
-        let ret = unsafe {
-            (self.data.offset(0), 45)
-        };
-        Some(ret)
     }
+
+    /// Commits space that has been written to in the buffer
+    pub fn commit(&mut self, count: usize) {
+        // de-commit any reservation if nothing was written
+        if count == 0 {
+            self.rsvp.count = 0;
+            self.rsvp.index = 0;
+            return;
+        }
+        // clip the commit count if it is larger than the requested size
+        let count = if count > self.rsvp.count {
+            self.rsvp.count
+        } else {
+            count
+        };
+        // if no blocks are currently in use, use A
+        if (self.a.count == 0) && (self.b.count == 0) {
+            self.a.index = self.rsvp.index;
+            self.a.count = count;
+            self.rsvp.count = 0;
+            self.rsvp.index = 0;
+            return;
+        }
+        // check if it's in A or B
+        if self.rsvp.index == self.a.count + self.a.index {
+            self.a.count += count;
+        } else {
+            self.b.count += count;
+        }
+        self.rsvp.count = 0;
+        self.rsvp.index = 0;
+    }
+
+    /// Gets a (pointer, count) tuple to the first contiguous block
+    /// or None if empty
+    fn get_contiguous_block(&self) -> Option<(*mut T, usize)> {
+        if self.a.count == 0 { return None; }
+        let ptr = unsafe { self.data.offset(self.a.index as isize) };
+        return Some( (ptr, self.a.count) );
+    }
+
+    /// De-commits space from the first contiguous block
+    fn decommit_block(&mut self, count: usize) {
+        if count >= self.a.count {
+            self.a.index = 0;
+            self.a.count = self.b.count;
+            self.b.count = 0;
+        } else {
+            self.a.count -= count;
+            self.a.index += count;
+        }
+    }
+
+    /// Queries how much data has been commit in the buffer
+    fn get_commited_size(&self) -> usize { self.a.count + self.b.count }
+
+    /// Queries how much space has been reserved in the buffer
+    fn get_reservation_size(&self) -> usize { self.rsvp.count }
+
+    /// Queries the maximum total size of the buffer
+    fn get_buffer_size(&self) -> usize { self.size }
 
     /// Gets the number of elements which are available after `A` for allocation
     /// This is the total buffer length minus the elements before `A` minus the
